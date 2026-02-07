@@ -2,14 +2,34 @@
   "version": 2,
   "builds": [
     {
-      "src": "api/index.js",
+      "src": "api/check.js",
       "use": "@vercel/node"
     }
   ],
   "routes": [
     {
-      "src": "/(.*)",
-      "dest": "api/index.js"
+      "src": "/api/check",
+      "dest": "/api/check.js",
+      "methods": ["POST"]
+    },
+    {
+      "src": "/api/check/?.*",
+      "dest": "/api/check.js",
+      "methods": ["POST"]
+    },
+    {
+      "handle": "filesystem"
+    },
+    {
+      "src": "/.*",
+      "status": 404,
+      "dest": "/404.json"
     }
-  ]
+  ],
+  "functions": {
+    "api/check.js": {
+      "memory": 1024,
+      "maxDuration": 30
+    }
+  }
 }
