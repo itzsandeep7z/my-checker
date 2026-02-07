@@ -1,13 +1,8 @@
 {
-  "name": "checker-api",
+  "name": "cc-check-vercel",
   "version": "1.0.0",
-  "main": "api/index.js",
-  "dependencies": {
-    "node-fetch": "^3.3.0"
-  },
+  "private": true,
   "engines": {
-    "node": "20.x"
+    "node": ">=18"
   }
 }
-
-
