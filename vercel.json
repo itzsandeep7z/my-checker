@@ -13,17 +13,9 @@
       "methods": ["POST"]
     },
     {
-      "src": "/api/check/?.*",
+      "src": "/api/check/?(.*)",
       "dest": "/api/check.js",
       "methods": ["POST"]
-    },
-    {
-      "handle": "filesystem"
-    },
-    {
-      "src": "/.*",
-      "status": 404,
-      "dest": "/404.json"
     }
   ],
   "functions": {
