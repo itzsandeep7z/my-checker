@@ -8,21 +8,27 @@
   ],
   "routes": [
     {
-      "src": "/check",
+      "src": "/api/check",
       "dest": "/check.js",
       "methods": ["POST"]
     },
     {
-      "src": "/check/?(.*)",
+      "src": "/api/check/?(.*)",
       "dest": "/check.js",
       "methods": ["POST"]
+    },
+    {
+      "handle": "filesystem"
+    },
+    {
+      "src": "/.*",
+      "status": 404
     }
   ],
   "functions": {
-    "api/check.js": {
+    "check.js": {
       "memory": 1024,
       "maxDuration": 30
     }
   }
 }
-
