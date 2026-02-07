@@ -2,19 +2,19 @@
   "version": 2,
   "builds": [
     {
-      "src": "api/check.js",
+      "src": "check.js",
       "use": "@vercel/node"
     }
   ],
   "routes": [
     {
-      "src": "/api/check",
-      "dest": "/api/check.js",
+      "src": "/check",
+      "dest": "/check.js",
       "methods": ["POST"]
     },
     {
-      "src": "/api/check/?(.*)",
-      "dest": "/api/check.js",
+      "src": "/check/?(.*)",
+      "dest": "/check.js",
       "methods": ["POST"]
     }
   ],
@@ -25,3 +25,4 @@
     }
   }
 }
+
