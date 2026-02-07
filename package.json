@@ -1,13 +1,13 @@
 {
-  "name": "cc-check-vercel",
+  "name": "my-checker",
   "version": "1.0.0",
   "private": true,
-  "description": "Simple serverless card checker API",
-  "main": "api/check.js",
+  "description": "Vercel serverless card checker",
+  "main": "check.js",
   "engines": {
     "node": ">=18.x"
   },
   "scripts": {
-    "dev": "echo 'No local dev – test via curl'"
+    "dev": "echo 'No local dev – test via curl / Postman'"
   }
 }
